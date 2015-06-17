@@ -1,0 +1,1 @@
+#docker run -p 5000:5000 -v /var/docker-registry:/var/docker-registry secure_registry:2.0 --restart="always" --name="docker-register"
