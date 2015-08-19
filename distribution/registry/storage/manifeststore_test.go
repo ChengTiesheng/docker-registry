@@ -6,16 +6,15 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/docker/distribution/registry/storage/cache"
-
 	"github.com/docker/distribution"
+	"github.com/docker/distribution/context"
 	"github.com/docker/distribution/digest"
 	"github.com/docker/distribution/manifest"
+	"github.com/docker/distribution/registry/storage/cache/memory"
 	"github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/inmemory"
 	"github.com/docker/distribution/testutil"
 	"github.com/docker/libtrust"
-	"golang.org/x/net/context"
 )
 
 type manifestStoreTestEnv struct {
@@ -30,7 +29,7 @@ type manifestStoreTestEnv struct {
 func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestEnv {
 	ctx := context.Background()
 	driver := inmemory.New()
-	registry := NewRegistryWithDriver(driver, cache.NewInMemoryLayerInfoCache())
+	registry := NewRegistryWithDriver(ctx, driver, memory.NewInMemoryBlobDescriptorCacheProvider(), true, true, false)
 
 	repo, err := registry.Repository(ctx, name)
 	if err != nil {
@@ -49,7 +48,11 @@ func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestE
 
 func TestManifestStorage(t *testing.T) {
 	env := newManifestStoreTestEnv(t, "foo/bar", "thetag")
-	ms := env.repository.Manifests()
+	ctx := context.Background()
+	ms, err := env.repository.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	exists, err := ms.ExistsByTag(env.tag)
 	if err != nil {
@@ -98,30 +101,43 @@ func TestManifestStorage(t *testing.T) {
 		t.Fatalf("unexpected error generating private key: %v", err)
 	}
 
-	sm, err := manifest.Sign(&m, pk)
-	if err != nil {
+	sm, merr := manifest.Sign(&m, pk)
+	if merr != nil {
 		t.Fatalf("error signing manifest: %v", err)
 	}
 
 	err = ms.Put(sm)
 	if err == nil {
-		t.Fatalf("expected errors putting manifest")
+		t.Fatalf("expected errors putting manifest with full verification")
 	}
 
-	// TODO(stevvooe): We expect errors describing all of the missing layers.
+	switch err := err.(type) {
+	case distribution.ErrManifestVerification:
+		if len(err) != 2 {
+			t.Fatalf("expected 2 verification errors: %#v", err)
+		}
+
+		for _, err := range err {
+			if _, ok := err.(distribution.ErrManifestBlobUnknown); !ok {
+				t.Fatalf("unexpected error type: %v", err)
+			}
+		}
+	default:
+		t.Fatalf("unexpected error verifying manifest: %v", err)
+	}
 
 	// Now, upload the layers that were missing!
 	for dgst, rs := range testLayers {
-		upload, err := env.repository.Layers().Upload()
+		wr, err := env.repository.Blobs(env.ctx).Create(env.ctx)
 		if err != nil {
 			t.Fatalf("unexpected error creating test upload: %v", err)
 		}
 
-		if _, err := io.Copy(upload, rs); err != nil {
+		if _, err := io.Copy(wr, rs); err != nil {
 			t.Fatalf("unexpected error copying to upload: %v", err)
 		}
 
-		if _, err := upload.Finish(dgst); err != nil {
+		if _, err := wr.Commit(env.ctx, distribution.Descriptor{Digest: dgst}); err != nil {
 			t.Fatalf("unexpected error finishing upload: %v", err)
 		}
 	}
@@ -140,6 +156,7 @@ func TestManifestStorage(t *testing.T) {
 	}
 
 	fetchedManifest, err := ms.GetByTag(env.tag)
+
 	if err != nil {
 		t.Fatalf("unexpected error fetching manifest: %v", err)
 	}
@@ -280,11 +297,102 @@ func TestManifestStorage(t *testing.T) {
 		}
 	}
 
-	// TODO(stevvooe): Currently, deletes are not supported due to some
-	// complexity around managing tag indexes. We'll add this support back in
-	// when the manifest format has settled. For now, we expect an error for
-	// all deletes.
-	if err := ms.Delete(dgst); err == nil {
+	// Test deleting manifests
+	err = ms.Delete(dgst)
+	if err != nil {
 		t.Fatalf("unexpected an error deleting manifest by digest: %v", err)
 	}
+
+	exists, err = ms.Exists(dgst)
+	if err != nil {
+		t.Fatalf("Error querying manifest existence")
+	}
+	if exists {
+		t.Errorf("Deleted manifest should not exist")
+	}
+
+	deletedManifest, err := ms.Get(dgst)
+	if err == nil {
+		t.Errorf("Unexpected success getting deleted manifest")
+	}
+	switch err.(type) {
+	case distribution.ErrManifestUnknownRevision:
+		break
+	default:
+		t.Errorf("Unexpected error getting deleted manifest: %s", reflect.ValueOf(err).Type())
+	}
+
+	if deletedManifest != nil {
+		t.Errorf("Deleted manifest get returned non-nil")
+	}
+
+	// Re-upload should restore manifest to a good state
+	err = ms.Put(sm)
+	if err != nil {
+		t.Errorf("Error re-uploading deleted manifest")
+	}
+
+	exists, err = ms.Exists(dgst)
+	if err != nil {
+		t.Fatalf("Error querying manifest existence")
+	}
+	if !exists {
+		t.Errorf("Restored manifest should exist")
+	}
+
+	deletedManifest, err = ms.Get(dgst)
+	if err != nil {
+		t.Errorf("Unexpected error getting manifest")
+	}
+	if deletedManifest == nil {
+		t.Errorf("Deleted manifest get returned non-nil")
+	}
+
+	r := NewRegistryWithDriver(ctx, env.driver, memory.NewInMemoryBlobDescriptorCacheProvider(), false, true, false)
+	repo, err := r.Repository(ctx, env.name)
+	if err != nil {
+		t.Fatalf("unexpected error getting repo: %v", err)
+	}
+	ms, err = repo.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ms.Delete(dgst)
+	if err == nil {
+		t.Errorf("Unexpected success deleting while disabled")
+	}
+}
+
+// TestLinkPathFuncs ensures that the link path functions behavior are locked
+// down and implemented as expected.
+func TestLinkPathFuncs(t *testing.T) {
+	for _, testcase := range []struct {
+		repo       string
+		digest     digest.Digest
+		linkPathFn linkPathFunc
+		expected   string
+	}{
+		{
+			repo:       "foo/bar",
+			digest:     "sha256:deadbeaf",
+			linkPathFn: blobLinkPath,
+			expected:   "/docker/registry/v2/repositories/foo/bar/_layers/sha256/deadbeaf/link",
+		},
+		{
+			repo:       "foo/bar",
+			digest:     "sha256:deadbeaf",
+			linkPathFn: manifestRevisionLinkPath,
+			expected:   "/docker/registry/v2/repositories/foo/bar/_manifests/revisions/sha256/deadbeaf/link",
+		},
+	} {
+		p, err := testcase.linkPathFn(defaultPathMapper, testcase.repo, testcase.digest)
+		if err != nil {
+			t.Fatalf("unexpected error calling linkPathFn(pm, %q, %q): %v", testcase.repo, testcase.digest, err)
+		}
+
+		if p != testcase.expected {
+			t.Fatalf("incorrect path returned: %q != %q", p, testcase.expected)
+		}
+	}
+
 }
